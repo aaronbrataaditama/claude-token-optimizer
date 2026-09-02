@@ -31,11 +31,12 @@ cost share (Opus-tier $5/$25 per MTok)
   TOTAL                                      100.0%
 
 prompt size per turn         p50 114,574   p90 315,999   max 996,642
-models                       opus-5 ×29,324 · sonnet-5 ×6,369 · haiku-4.5 ×2,339 · opus-4.8 ×1,865
+model mix                    opus-5 71% · sonnet-5 15% · haiku-4.5 6% · opus-4.8 4%
 ```
 
-**Absolute spend and corpus size have been removed** from this write-up; what remains is every
-ratio, share and per-turn figure, which is where the transferable content is. Cost shares were
+**Absolute spend, corpus size and aggregate token volumes have been removed** from this write-up.
+What remains is every share, ratio, per-turn and per-call figure — which is where the transferable
+content is, and which does not reconstruct the totals. Cost shares were
 computed from list API prices applied to measured token counts — under a subscription those are
 notional rather than an invoice, but the shares hold either way, and the shares are what drive
 every decision below.
@@ -61,7 +62,8 @@ This is Scenario B from `economics.md` §5, and more extreme than the version wr
 churning a prefix. Measured, it is **39% of cost** — nearly as large as reads, and the
 second-biggest line by a wide margin.
 
-Both TTLs are in use: 188M tokens at the 5-minute rate (1.25×) and 109M at the 1-hour rate (2.0×).
+Both TTLs are in use, split roughly 63/37 by volume between the 5-minute rate (1.25×) and the
+1-hour rate (2.0×).
 Writes are what you pay every time new content enters a cached prefix — which in an agent loop is
 every turn. The design treated this as an edge case and it is a structural cost.
 
@@ -199,25 +201,27 @@ assistant text                    29             3.4%
 Among tool results, one tool dominates:
 
 ```text
-tool          est. tokens   share    calls   median      p95
-Read            2,202,725   55.0%      860      708   10,205
-Bash            1,236,761   30.9%    3,768      155    1,163
-Edit              115,248    2.9%    1,575       69       90
-Grep               93,360    2.3%      209      227    1,884
+tool      share of tool-result volume   call share   median   p95
+Read                            55.0%        13.1%      708   10,205
+Bash                            30.9%        57.4%      155    1,163
+Edit                             2.9%        24.0%       69       90
+Grep                             2.3%         3.2%      227    1,884
 ```
 
-`Read` produces 55% of all tool-result volume from 860 calls. Its median is modest at 708 tokens; its
+`Read` produces 55% of all tool-result volume from 13% of the calls. Its median is modest at 708
+tokens; its
 **p95 is 10,205**. It is the tail that fills context, not the typical call.
 
 Harness-injected attachments are 12.7%, and are mostly outside application control — though three of
 the largest scale with what is installed:
 
 ```text
-edited_text_file      376,937 tok    267 x 1,411
-skill_listing         245,193 tok    137 x 1,789
-deferred_tools_delta  218,156 tok    128 x 1,704
-agent_listing_delta   191,062 tok     96 x 1,990
-nested_memory         160,071 tok     68 x 2,353
+                      share of attachment volume   tokens per injection
+edited_text_file                           21.3%                  1,411
+skill_listing                              13.9%                  1,789
+deferred_tools_delta                       12.4%                  1,704
+agent_listing_delta                        10.8%                  1,990
+nested_memory                               9.1%                  2,353
 ```
 
 ---
@@ -249,7 +253,7 @@ offsets, or `Grep` to locate before `Read` to retrieve, attack the tail directly
 
 **3. Shrink the 41,500-token floor.** Fewer installed skills, agents and MCP servers; a smaller
 `CLAUDE.md`. Every token here is multiplied by every turn of every session. Worth noting: installing
-the `token-optimization` skill added to this floor and to the 137 `skill_listing` re-injections — the
+the `token-optimization` skill added to this floor and to every `skill_listing` re-injection — the
 optimizer pays its own meta-bloat tax, which is precisely what invariant V15 was written to bound.
 
 **4. Everything else in Phase 2′.** Externalization, dispositions, budget managers. Real, but
