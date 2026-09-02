@@ -1,0 +1,797 @@
+# ---------------------------------------------------------------------------
+# Token Optimization & Context Management — shipped defaults
+#
+# Deliverable 9, Stage 2. Every value here is a default, not a constant.
+# Nothing in the implementation reads a literal that is not routed through
+# this file. See docs/configuration.md for the layering model, the load-time
+# validation invariants, and what may be changed at runtime.
+#
+# Values expressed as fractions are fractions of the *resolved* model window,
+# so the same configuration is valid across models with different windows.
+# ---------------------------------------------------------------------------
+
+meta:
+  config_version: 1                # bumped on any breaking key change
+  memory_schema_version: 1         # persisted with every memory record (INV: V13)
+  profile: default                 # overridden by config/profiles/*.yaml
+
+# ---------------------------------------------------------------------------
+# 1. Fast path — the NO_OPTIMIZATION gate (§17 S0, INV-3)
+#
+# Every condition must hold. All inputs are already in hand from the previous
+# turn's ledger entry; evaluating this costs a handful of comparisons.
+# ---------------------------------------------------------------------------
+fast_path:
+  enabled: true
+  # Utilisation alone is a useless signal on a large window: 35% of 1M is
+  # 350,000 tokens, which is not a small turn by any measure of cost. Both
+  # gates must pass (D9 section 11, measured 2026-09).
+  max_utilization: 0.35            # fraction of the window already in use
+  max_prompt_tokens: 60000         # absolute ceiling - cost tracks this, not the fraction
+  max_tools: 3                     # candidate tools for the task
+  min_turn_cost_usd: 0.01          # below this, optimizing cannot pay for itself
+  require_warm_prefix: true
+  allow_media: false               # any image/PDF forces the full engine
+  max_risk: LOW                    # risk prior carried from the previous turn
+  max_consecutive: 20              # force a full evaluation every N turns
+  blocking_flags:                  # any of these last turn disables the fast path
+    - BUDGET_PRESSURE
+    - LOOP_SUSPECTED
+    - RETRY_ESCALATED
+    - MANIFEST_RETRIEVAL           # the agent had to fetch dropped data back
+
+  # Applied on the fast path as well as the full path: their cost is a table
+  # lookup, so they are never gated. Removing anything from this list makes the
+  # fast path strictly worse for no saving.
+  always_on:
+    - max_tokens_by_operation_class
+    - stop_sequences
+    - structured_output_when_schema_present
+    - stable_prefix_ordering
+    - append_only_history
+    - per_tool_result_budgets
+    - drop_manifest
+    - trust_labelling
+
+# ---------------------------------------------------------------------------
+# 2. Optimization overhead budget (INV-3)
+# ---------------------------------------------------------------------------
+overhead:
+  floor_usd: 0.0005                # a cheap turn can still afford a deterministic advisor
+  max_fraction: 0.10               # of the estimated baseline turn cost
+  max_model_advisor_calls: 1       # Tier-2+ advisor invocations per turn (0 on the fast path)
+  advisor_deadline_ms: 400         # per advisor; exceeded ⇒ neutral fragment (INV-2)
+  scheduler:
+    ranking: savings_lo_over_cost_hi   # conservative on both sides
+    min_ratio: 1.0                     # stop scheduling once expected savings ≤ overhead
+    prior_source: ledger_ewma
+    prior_halflife_turns: 200
+    cold_advisor_policy: shadow_first  # a new advisor earns its prior in shadow, not live
+
+# ---------------------------------------------------------------------------
+# 3. Budgets (§4)
+#
+# Allocation order: reserve output first, then system/skill, then the rest.
+# All recomputed on any tokenizer change (INV-8).
+# ---------------------------------------------------------------------------
+budgets:
+  reserved_output_fraction: 0.12
+  reserved_system_skill_fraction: 0.06
+  safety_margin_fraction: 0.03     # never allocated; absorbs estimator error
+
+  working_fraction: 0.45           # conversation, task state, current turn
+  tool_results_fraction: 0.22
+  memory_fraction: 0.12
+
+  # Per-tool result budgets, in tokens. `default` applies to any tool without
+  # an entry. Tool-specific entries are the point of this block: a search
+  # result and a file read do not deserve the same allowance.
+  per_tool:
+    default: 3000
+    search: 2000
+    database_query: 4000
+    file_read: 8000
+    http_request: 3000
+    code_execution: 1500           # a bypass returning more than this has failed its job
+
+  # Per-modality budgets (§15). Images scale with resolution, so the budget is
+  # expressed in tokens and enforced by downscaling before the call.
+  per_modality:
+    image:
+      max_tokens: 1600
+      max_edge_px: 1568
+      prefer_text_extraction: true      # use OCR/DOM/accessibility tree when layout is irrelevant
+      resend_unchanged: false           # never re-send an identical screenshot
+      max_per_task: 8
+    pdf:
+      max_tokens: 6000
+      rasterize: false                  # extract text unless layout carries meaning
+    audio:
+      max_tokens: 4000
+
+  # Reserved output is sized from the operation class rather than a flat
+  # fraction (D4 §2): reserving 12% of a 200k window for a 16-token
+  # classification answer gives away working context for nothing.
+  output_headroom: 1.5             # multiplier on the operation class max_tokens
+  min_reserved_output: 512
+
+  # max_tokens by operation class (§13). Never the provider default.
+  max_tokens_by_operation_class:
+    classification: 16
+    extraction: 256
+    routing: 64
+    summarization: 512
+    tool_argument_generation: 256
+    code_generation: 4000
+    final_answer: 2000
+    default: 1024
+
+# ---------------------------------------------------------------------------
+# 4. Thresholds and hysteresis (§4)
+#
+# Every band has separate enter and exit levels. A single threshold makes a
+# session oscillate — compact, refill, compact — repeatedly summarizing the
+# same content and invalidating the prefix each time. enter > exit is a
+# load-time invariant (V1).
+# ---------------------------------------------------------------------------
+thresholds:
+  bands:
+    - band: NORMAL
+      enter: 0.00
+      exit: 0.00
+    - band: PRUNE
+      enter: 0.50
+      exit: 0.42
+    - band: COMPACT
+      enter: 0.70
+      exit: 0.60
+    - band: AGGRESSIVE
+      enter: 0.80
+      exit: 0.72
+    - band: EMERGENCY
+      enter: 0.90
+      exit: 0.82
+  emergency_suspends_economics: true   # a failed turn costs more than a cold cache
+  emergency_rate_alarm_per_100_turns: 2
+
+  # Bands are entered on EITHER the fraction above or the absolute count below,
+  # whichever trips first. On a 1M window the fractions alone never trip until
+  # a turn already costs several times a small one.
+  absolute_enter_tokens:
+    PRUNE:      60000
+    COMPACT:    120000
+    AGGRESSIVE: 250000
+    EMERGENCY:  600000
+
+# ---------------------------------------------------------------------------
+# 5. Context selection and scoring (§5)
+# ---------------------------------------------------------------------------
+context:
+  scoring_weights:                 # multiplied, not summed
+    relevance: 1.0
+    importance: 1.0
+    recency: 1.0
+    dependency: 1.0
+    future_value: 1.0
+  recency_halflife_turns: 12
+  expected_remaining_turns_default: 6      # horizon for retention-vs-retrieval maths
+  dependency_closure: true                 # promote items a retained item depends on
+  dependency_graph_enabled: true
+
+  disposition:
+    discard_requires_all:
+      - low_future_value
+      - cheap_to_reconstruct
+    retrieve_later_when: reconstruction_cost_below_retention_cost
+    externalize_when_tokens_above: 1500   # tune against the measured p95 tool result, not the window
+    never_compress:                        # §6 — lossy forms forbidden outright
+      - user_requirements
+      - constraints
+      - decisions
+      - identifiers
+      - names
+      - dates
+      - numeric_values
+      - configuration
+      - code
+      - api_contracts
+      - unresolved_issues
+      - commitments
+      - state_transitions
+
+# ---------------------------------------------------------------------------
+# 6. Compression and compaction (§6, §9)
+# ---------------------------------------------------------------------------
+compression:
+  aggressiveness: balanced         # conservative | balanced | aggressive
+  levels:
+    conservative:
+      max_ladder_rung: 4           # stop at relevance ranking; no summarization
+      summary_validation: always
+    balanced:
+      max_ladder_rung: 6
+      summary_validation: on_low_confidence
+    aggressive:
+      max_ladder_rung: 8
+      summary_validation: on_low_confidence
+  never_summarize_same_content_twice: true
+  canonical_reference_required_when_lossy: true    # INV-6 / principle 8
+  summary_confidence_min: 0.7                      # below this, keep the original externally
+
+  compaction:
+    tail_first: true                               # reduce outside the cache before inside it
+    require_positive_benefit: true                 # INV-7
+    batch_at_boundaries:
+      - SESSION_START
+      - TASK_TRANSITION
+      - TTL_LAPSE
+    max_pending_batched: 8
+
+# ---------------------------------------------------------------------------
+# 6b. Payload middleware (Deliverable 3, Stage 3)
+#
+# The reduction ladder and its per-rung policies. Rung order is fixed; the
+# aggressiveness level caps how far up the LOSSY rungs it may climb, and
+# externalization is always reachable because it is lossless.
+# ---------------------------------------------------------------------------
+middleware:
+  archive_before_reduce: true      # every drop must have a real recovery path (INV-6)
+  ladder:
+    rungs:
+      - remove_nulls
+      - remove_irrelevant_fields
+      - deduplicate
+      - rank_records
+      - truncate_fields
+      - summarize_repetitive
+      - project_and_paginate
+      - externalize
+    lossy_rungs: [truncate_fields, summarize_repetitive]
+    always_available: [externalize]         # never capped by aggressiveness
+
+  nulls:
+    drop_explicit_null: false      # an explicit null is often a positive statement
+    drop_empty_string: true
+    drop_empty_collection: true
+
+  relevance:
+    min_field_relevance: 0.15
+    min_field_bytes: 120           # dropping a 12-byte field saves nothing and risks something
+    protected_field_patterns:      # never scored, never dropped
+      - "*_id"
+      - "id"
+      - "tenant*"
+      - "owner*"
+      - "acl*"
+      - "scope*"
+      - "permission*"
+      - "role*"
+      - "visibility*"
+      - "*_key"
+      - "etag"
+      - "version"
+
+  dedupe:
+    identity: [declared_key, content_hash]  # declared first, full-content hash as fallback
+    record_multiplicity: true               # collapsing 3 rows into 1 must not lose "3"
+
+  truncation:
+    boundary: semantic             # sentence, else word, else codepoint — never mid-token
+    min_field_bytes: 200
+    marker: "…[+{n} chars]"
+
+  rank:
+    min_records: 5                 # never rank a result down to nothing
+    preserve_total_count: true     # keeping 50 of 4,312 without saying 4,312 changes the answer
+
+  pagination:
+    min_page_size: 5
+    cursor_based: true             # value cursors against a pinned order, never offsets
+    require_sort_key: true         # an unordered result is externalized, not paginated
+
+  summarize:
+    min_records: 25                # below this, summarization cannot pay for its own call
+
+  representation:
+    max_candidates: 3
+    exact_measure_final: true      # sample to choose, measure the winner exactly
+    yaml_requires:                 # principle 7, as a gate rather than an assumption
+      min_key_repetition: 0.5
+      max_mean_string_len: 40
+      max_depth: 3
+
+# ---------------------------------------------------------------------------
+# 6c. Token estimation (Deliverable 3 §11)
+#
+# Estimation is itself a cost. Exact below the threshold, sampled above it,
+# and always accompanied by a byte count that survives a model handoff.
+# ---------------------------------------------------------------------------
+estimation:
+  exact_below_bytes: 65536
+  sample_windows: 8
+  sample_window_bytes: 4096
+  extrapolation_variance_alarm: 0.15
+  approximate_safety_multiplier: 1.25
+  bytes_per_token_fallback: 3.5    # only when no adapter exists for the family
+
+# ---------------------------------------------------------------------------
+# 6d. Context manager (Deliverable 4, Stage 3)
+# ---------------------------------------------------------------------------
+context_manager:
+  scoring:
+    relevance_floor: 0.05
+    future_value_prior: 0.3
+    low_future_value: 0.2
+    high_future_value: 0.6
+    high_relevance: 0.7
+    importance_by_kind:
+      SYSTEM: 1.0
+      SKILL: 1.0
+      STATE: 0.95
+      MESSAGE: 0.6
+      MEMORY: 0.6
+      TOOL_SCHEMA: 0.5
+      TOOL_RESULT: 0.45
+      ARTIFACT: 0.4
+      MEDIA: 0.35
+
+  summary_validation:
+    critical_classes: [identifiers, numeric_values, dates, names, decisions, constraints]
+    numeric_match_required: true
+    identifier_match_required: true
+    max_new_entities: 0            # a summary may not introduce an entity the source lacked
+    contradiction_check: true
+
+  checkpoint:
+    structural_sharing: true       # a checkpoint must be O(1), or it gets skipped where it matters
+    max_per_turn: 8
+    collapse_when_exceeded: true
+
+# ---------------------------------------------------------------------------
+# 7. Cache (§9)
+# ---------------------------------------------------------------------------
+cache:
+  prefix:
+    stable_layer_order:            # most static first; reordering is a config error (V4)
+      - system
+      - skill
+      - tool_schemas
+      - long_term_memory
+      - conversation_history
+      - current_turn
+    append_only_history: true
+    max_breakpoints: provider      # resolved from the capability probe
+    min_prefix_tokens: provider
+    ttl_seconds: provider
+
+  result:
+    enabled: true
+    ttl_seconds: 900
+    key_includes: [tool, normalized_args, tenant, user, auth_fingerprint]
+    idempotency_required_for_mutations: true
+
+  semantic:
+    enabled: false                 # off by default: the personalization footgun (V8)
+    ttl_seconds: 300
+    require_validation_when:
+      - authorization_sensitive
+      - time_sensitive
+    forbid_when_scope_includes_user: true
+
+  schema:
+    enabled: true
+    ttl_seconds: 86400
+
+  retrieval:
+    enabled: true
+    ttl_seconds: 120
+
+  invalidate_on:
+    - ttl_expiry
+    - source_mutation_event
+    - permission_change
+    - tenant_scope_change
+    - task_transition
+
+# ---------------------------------------------------------------------------
+# 8. Tools and progressive disclosure (§2, §3)
+# ---------------------------------------------------------------------------
+tools:
+  registry:
+    metadata_only_index: true      # candidate selection never loads full schemas
+    refresh_seconds: 3600
+    candidate_pool: 32             # index hits considered before ranking
+    min_capability_score: 0.2
+
+  router:
+    k_candidates: 6
+    max_active_tools: 12
+    default_disclosure_level: 0
+    escalate_to_full_schema_on: about_to_call
+    compact_signatures: true       # typed signatures in context, JSON Schema on the wire
+    signature_style: typescript
+    signature_max_depth: 2         # deeper objects render as `object` rather than inline
+    prefer_stable_projection: true
+    churn_tolerance_usd: 0.002     # accept churn only if savings exceed this by the margin below
+    churn_margin: 1.5
+    stability_window_turns: 8      # do not change the tool set within this many turns unless forced
+    incumbency_bonus: 1.25         # a loaded tool is cheaper to keep than a new one is to add
+    rerank_margin: 0.05            # a model reranker runs only when the top two are this close
+    rerank_top_k: 4
+
+  necessity:
+    require_positive_information_value: true
+    include_non_token_costs: true  # API, DB compute, search fees, execution, transfer, rate limits
+    default_hit_rate_prior: 0.5
+    # What a correct decision is worth, by task risk. The value-of-information
+    # test is only as meaningful as this number, and it is deliberately a crude
+    # per-deployment estimate rather than a computed quantity.
+    value_of_correct_decision_usd:
+      LOW: 0.02
+      MEDIUM: 0.20
+      HIGH: 2.00
+
+  bypass:                          # code-execution bypass (§7)
+    enabled: true
+    min_payload_tokens: 5000
+    min_homogeneous_calls: 4
+    triggers_on_data_heavy: true
+    forbid_on_mutations_without_idempotency: true
+    sandbox:
+      cpu_ms: 10000
+      memory_mb: 512
+      wall_ms: 30000
+      network: ALLOWLIST
+      filesystem: SCRATCH
+      egress_bytes_max: 65536      # a bypass returning more has failed its purpose
+
+# ---------------------------------------------------------------------------
+# 9. Models and reasoning (§10)
+#
+# Tiers are roles, not vendors. The provider block below binds them to actual
+# model ids, so a deployment can swap providers without touching routing rules.
+# ---------------------------------------------------------------------------
+models:
+  tiers:
+    1: deterministic               # code and rules; no model at all
+    2: tiny
+    3: small
+    4: large
+  # Each binding is:
+  #   { model: <id>, provider: <id>,
+  #     prices: { input, output, cache_read, cache_write },   # USD per million
+  #     window: <int>, tokenizer: <family>, supports_reasoning: <bool> }
+  # Shipped empty so no provider assumption is hard-coded.
+  bindings:
+    tiny: null                     # set per deployment
+    small: null
+    large: null
+
+  routing:
+    default_tier: 4
+    prefer_deterministic: true
+    by_operation_class:
+      classification: 2
+      routing: 2
+      extraction: 2
+      duplicate_detection: 2
+      field_filtering: 2
+      simple_summarization: 3
+      planning: 4
+      ambiguous_task: 4
+      high_risk_action: 4
+    escalate_on_low_confidence_below: 0.55
+    router_must_pay_for_itself: true
+
+    # Quality is a hard filter applied before cost, never a weighted term
+    # traded against it (D6 §3).
+    quality_floor_by_risk:
+      LOW: 0.80
+      MEDIUM: 0.90
+      HIGH: 0.96
+    min_quality_samples: 30        # below this, use the tier prior with a widened interval
+    tier_quality_prior: { 2: 0.78, 3: 0.88, 4: 0.94 }
+    unmeasured_quality_width: 0.10
+
+    # Switching model family abandons a warm prefix (D6 §1). A switch must look
+    # meaningfully cheaper, not marginally, before it is taken.
+    switching_cost_aware: true
+    switch_margin: 1.15
+    max_escalation_steps: 2
+
+  reasoning:
+    tiers: [NONE, LOW, MEDIUM, HIGH]
+    default: MEDIUM
+    # Thinking tokens bill as output — the most expensive tokens in the system.
+    thinking_tokens: { NONE: 0, LOW: 1024, MEDIUM: 4096, HIGH: 16384 }
+    by_operation_class:
+      classification: NONE
+      extraction: NONE
+      field_filtering: NONE
+      formatting: NONE
+      routing: NONE
+      simple_summarization: LOW
+      planning: HIGH
+      ambiguous_task: HIGH
+      high_risk_action: HIGH
+    forbid_for_subagents: true     # mechanical work never gets extended thinking
+    escalate_before_model_tier: true   # rung 2 of the ladder, before rung 3
+
+  handoff:
+    recompute_budgets_on_tokenizer_change: true    # INV-8, not optional (V5)
+    verify_against_byte_bound: true
+
+# ---------------------------------------------------------------------------
+# 10. Delegation and parallelism (§11, §12)
+# ---------------------------------------------------------------------------
+delegation:
+  enabled: true
+  max_depth: 2                     # above sane_depth_limit requires explicit_deep_delegation (V6)
+  sane_depth_limit: 2
+  explicit_deep_delegation: false
+  max_subagents_per_turn: 4
+  max_subagents_per_session: 24
+  require_structured_output: true
+  require_explicit_input_allowlist: true    # never "the whole conversation" (V7)
+  forbid_skill_injection: true             # a sub-agent never loads this skill
+  trust_ceiling: min_of_inputs
+  include_cache_state_in_economics: true
+  min_expected_saving_usd: 0.005           # below this, delegate nothing
+
+  # Cost bounds. Counts bound concurrency; only budgets bound cost.
+  spawn_budget_usd_per_turn: 0.25
+  spawn_budget_usd_per_session: 2.00
+  depth_attenuation: 0.5                   # each level gets this fraction of its parent allowance
+  max_tool_calls_per_subagent: 6
+
+  # Transfer discipline. A subtask needing more than this much context was the
+  # wrong thing to delegate — the work belongs where the context already is.
+  max_context_transfer_tokens: 4000
+  inline_threshold_tokens: 800             # larger inputs travel as references, not payloads
+  strict_inputs: true                      # an unlisted dependency is a spec error, not a fixup
+
+  # Returns
+  result_max_tokens: 512
+  result_schema_retries: 1                 # restate the contract; never enlarge the context
+
+parallelism:
+  enabled: true
+  max_branches: 4
+  reducer:
+    order: DEPENDENCY_THEN_DISPATCH        # never completion order (V9)
+    atomic_commit: true
+    conflict_policy: explicit_precedence
+    # Applied in order. If none separates two claims, both are committed as
+    # disputed rather than one being picked (INV-9).
+    conflict_precedence: [higher_trust, more_recent_valid_from, lower_dispatch_index]
+    unresolved_conflicts: surface_as_disputed
+    corroboration: true                    # agreement between branches is evidence, not duplication
+  uncertain_dependency: sequential         # INV-9
+  speculation:
+    enabled: false                         # advanced; flag-isolated, shadow-proven
+    max_branches: 2
+    min_probability: 0.4
+    forbid_side_effects: true
+    charge_discarded_branches: true
+
+# ---------------------------------------------------------------------------
+# 11. Retry, loops and circuit breakers (§16)
+# ---------------------------------------------------------------------------
+retry:
+  max_retries_per_step: 2
+  max_retries_per_turn: 5
+  backoff:
+    initial_ms: 250
+    multiplier: 2.0
+    max_ms: 8000
+    jitter: true
+  forbid_identical_retry: true             # never re-ask without changing the input
+  ladder:
+    - deterministic_fix
+    - retry_with_changed_input
+    - raise_reasoning_effort
+    - escalate_model_tier
+    - fallback_tool
+    - abort_normalized
+
+guards:
+  max_iterations: 12
+  max_tool_calls_per_turn: 12
+  max_context_growth_tokens_per_turn: 24000
+  wall_clock_ms: 120000
+  loop_detection:
+    identical_call_threshold: 2
+    cycle_window: 6
+    context_growth_without_progress_turns: 3
+
+circuit_breaker:
+  failure_threshold: 4
+  window_seconds: 120
+  open_seconds: 60
+  half_open_probes: 1
+
+failure_reporting:
+  context_error_lines: 1                   # exactly one normalized line
+  raw_details_to_archive: true
+  rollback_failed_branches: true
+
+# ---------------------------------------------------------------------------
+# 12. Memory (§5)
+# ---------------------------------------------------------------------------
+memory:
+  extraction:
+    at_turn_boundary_only: true
+    semantic_extraction_at: SESSION_END    # once per session, not per turn
+    max_facts_per_session: 40
+  retention:
+    working_ttl: task
+    episodic_ttl_days: 90
+    semantic_ttl_days: 730
+    selective: true                        # never indiscriminate chronological summarization
+  temporal_validity:
+    require_as_of_on_query: true
+    exclude_superseded: true
+    contradiction_policy: provenance_then_recency
+    unresolved: surface_as_disputed
+  provenance:
+    required_fields:
+      [source, pointer, trust_level, confidence, scope, auth, derived,
+       created_at, updated_at, valid_from, valid_until, supersedes]
+    append_with_supersede: true            # never update a fact in place
+  resumption:
+    bundle_only: true                      # never replay raw history
+    max_bundle_tokens: 2000
+  migration:
+    on_version_mismatch: migrate_or_refuse_start
+
+# ---------------------------------------------------------------------------
+# 13. Security (§19) — this block can only be tightened by later layers (V2)
+# ---------------------------------------------------------------------------
+security:
+  trust:
+    levels: [EXTERNAL, TOOL, USER, SYSTEM]
+    derived_level: min_of_inputs
+    propagate_through: [reduction, summarization, delegation, storage, rehydration]
+    render_untrusted_as: delimited_data_with_label
+    flag_instruction_like: true
+    obey_instruction_like: false
+  sanitization:
+    before_external_write: true            # archives, memory stores, vector indexes (V3)
+    detect: [pii, secrets, credentials, tokens]
+    action: redact_and_record
+  isolation:
+    cache_key_includes_scope: true
+    cross_tenant_reuse: forbidden
+    cross_user_semantic_cache: forbidden
+    sandbox_inherits_auth: true
+  retention:
+    archive_days: 30
+    raw_log_days: 30
+    derived_summary_days: 90
+  erasure:
+    propagate_to: [archive, memory, caches, derived_summaries, embeddings]
+    max_completion_hours: 24
+
+# ---------------------------------------------------------------------------
+# 14. Telemetry (§18)
+# ---------------------------------------------------------------------------
+telemetry:
+  enabled: true
+  sample_rate: 1.0
+  baseline_method_default: ESTIMATED       # MEASURED only in shadow/AB (V10)
+  record_categories:
+    [input, output, cached, uncached, cache_write, context, tool_schema,
+     tool_input, tool_output, memory, retrieval, subagent, retry, thinking,
+     multimodal, wasted, saved, cost, latency, cache_invalidation,
+     bypass_savings, optimization_overhead]
+  decision_trace: true
+  record_fast_path_blockers: true          # why turns fail the S0 test; free and diagnostic
+  estimator_bias:
+    enabled: true
+    alarm_abs_bias: 0.20
+    window_turns: 500
+    on_alarm: reduce_confidence            # INV-9 then makes behaviour conservative
+
+# ---------------------------------------------------------------------------
+# 15. The runtime skill — meta-bloat guard (Deliverable 1)
+#
+# The always-loaded instruction set is measured at deploy time and gated. An
+# optimizer that ships with a verbose skill prompt recreates the exact bloat it
+# exists to remove, so this is a hard failure, not a warning (V15).
+# ---------------------------------------------------------------------------
+skill:
+  path: skill/SKILL.md
+  references_dir: skill/references
+  always_loaded: [SKILL.md]        # everything else loads only on its trigger
+  target_tokens: 600
+  max_tokens: 800                  # deployment fails above this
+  reference_max_tokens: 900        # per reference file, loaded one at a time
+  measure_with: target_model_tokenizer
+  cache_stable: true               # the skill layer must not vary per turn
+  # Every always-loaded token is multiplied by every turn of every session, and
+  # sits inside a measured ~41,500-token session floor. Installed skills also
+  # re-inject their listing many times per session - the ceiling is not a
+  # formality (V15).
+  measured_session_floor_tokens: 41500
+
+# ---------------------------------------------------------------------------
+# 16. Gates and rollout (§20)
+# ---------------------------------------------------------------------------
+gates:
+  acceptance:
+    cost_reduction_target: 0.40
+    require_statistical_significance: true
+    confidence_level: 0.95
+    max_success_drop_abs: 0.02
+    max_p95_latency_increase: 0.10
+  per_optimization:
+    max_success_drop_abs: 0.01
+    max_p95_latency_increase: 0.10
+    require_significant_token_reduction: true
+  workload_classes:                        # always reported separately, never only in aggregate
+    [qa, research, analytics, coding, long_doc, workflow,
+     orchestration, multimodal, long_session, high_cache_reuse]
+  rollout:
+    shadow_before_cutover: true
+    min_shadow_turns: 500
+    ab_split: 0.10
+    block_promotion_when_gates_unavailable: true    # fails closed on change
+  drift:
+    rerun_on_model_version_change: true
+    rerun_on_provider_change: true
+    pin_previous_until_pass: true
+
+# ---------------------------------------------------------------------------
+# 17. Per-optimization flags
+#
+# Every mechanism is individually switchable for rollback. `shadow` runs it
+# log-only. Phase assignment is decided by the Stage 5 mechanism inventory;
+# these defaults reflect the Stage 1 phase hints.
+# ---------------------------------------------------------------------------
+flags:
+  fast_path: on
+  per_tool_budgets: on
+  drop_manifest: on
+  output_controls: on
+  stable_prefix_ordering: on
+  upstream_query_optimization: on
+  payload_middleware: on
+  result_cache: on
+  context_scoring: on
+  externalization: on
+  selective_retention: on
+  progressive_tool_disclosure: shadow
+  model_routing: shadow
+  reasoning_routing: shadow
+  code_execution_bypass: shadow
+  compaction_benefit_gate: on
+  subagent_delegation: off
+  parallel_branches: off
+  speculative_execution: off
+  semantic_cache: off
+  dependency_graph: off
+
+# ---------------------------------------------------------------------------
+# 18. Providers
+#
+# Probed at startup, not at first use. `native` lists optimizations the
+# provider already performs; the middleware equivalent is disabled for that
+# provider unless a benchmark shows otherwise (V11).
+# ---------------------------------------------------------------------------
+providers:
+  probe_at_startup: true
+  refuse_start_on_probe_mismatch: false    # log and use declared values
+  defaults:
+    prompt_cache_supported: false
+    cached_input_discount: 0.0
+    max_breakpoints: 0
+    min_prefix_tokens: 0
+    cache_ttl_seconds: 0
+    structured_output: false
+    function_calling: true
+    batch: false
+    tokenizer: generic
+    native: []
+  # Per-provider entries are supplied by the deployment; the shipped file
+  # carries none so that no provider assumption is hard-coded.
+  entries: {}

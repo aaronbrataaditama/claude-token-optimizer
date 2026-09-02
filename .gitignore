@@ -1,0 +1,19 @@
+# Measured output from your own transcripts. Contains project names and spend
+# figures — this is your data, not the project's. Never commit it.
+baseline.json
+*.baseline.json
+/reduce-archive/
+/arch/
+
+# Local editor / harness state
+.claude/settings.local.json
+
+# Saved copies of the published artifact
+docs/*.html
+docs/*_files/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

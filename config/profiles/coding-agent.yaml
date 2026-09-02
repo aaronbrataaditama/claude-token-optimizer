@@ -1,0 +1,111 @@
+# Profile: coding agent
+#
+# File reads, long-lived sessions, many tools, and a hard constraint the other
+# profiles do not have: code, identifiers and schemas must never be summarized
+# in place. Savings come from externalization and on-demand retrieval, almost
+# never from compression.
+#
+# Layered over config/optimizer.defaults.yaml. Only differences appear here.
+
+meta:
+  profile: coding-agent
+
+fast_path:
+  max_utilization: 0.30
+  max_tools: 4
+  min_turn_cost_usd: 0.01
+  max_consecutive: 15
+
+overhead:
+  max_fraction: 0.08
+
+budgets:
+  reserved_output_fraction: 0.20    # diffs and files are the product
+  tool_results_fraction: 0.30
+  memory_fraction: 0.08
+  per_tool:
+    file_read: 12000
+    search: 3000
+    code_execution: 3000
+    database_query: 2000
+  max_tokens_by_operation_class:
+    code_generation: 8000
+    final_answer: 3000
+
+thresholds:
+  bands:
+    - { band: NORMAL,     enter: 0.00, exit: 0.00 }
+    - { band: PRUNE,      enter: 0.48, exit: 0.40 }
+    - { band: COMPACT,    enter: 0.68, exit: 0.58 }
+    - { band: AGGRESSIVE, enter: 0.78, exit: 0.70 }
+    - { band: EMERGENCY,  enter: 0.88, exit: 0.80 }
+
+# The defining constraint of this profile. A summarized function signature that
+# drops a parameter produces code that does not compile, and the agent cannot
+# tell that from context.
+context:
+  expected_remaining_turns_default: 10
+  disposition:
+    externalize_when_tokens_above: 1200
+    never_compress:
+      - user_requirements
+      - constraints
+      - decisions
+      - identifiers
+      - names
+      - dates
+      - numeric_values
+      - configuration
+      - code
+      - api_contracts
+      - unresolved_issues
+      - commitments
+      - state_transitions
+      - file_paths
+      - type_definitions
+      - test_expectations
+      - stack_traces
+      - diffs
+
+compression:
+  aggressiveness: conservative
+  canonical_reference_required_when_lossy: true
+  summary_confidence_min: 0.85
+
+# Many tools, and the set genuinely shifts between tasks — so disclosure pays,
+# but only at task boundaries, not per turn.
+tools:
+  router:
+    k_candidates: 10
+    prefer_stable_projection: true
+    churn_tolerance_usd: 0.004
+  bypass:
+    enabled: true
+    min_payload_tokens: 6000        # code review over many files, not typical edits
+    min_homogeneous_calls: 6
+
+parallelism:
+  enabled: true
+  max_branches: 4                   # independent file reads and searches
+
+delegation:
+  enabled: true
+  max_subagents_per_turn: 2
+  min_expected_saving_usd: 0.01
+
+memory:
+  extraction:
+    max_facts_per_session: 30
+  retention:
+    episodic_ttl_days: 180
+
+flags:
+  progressive_tool_disclosure: on
+  code_execution_bypass: shadow
+  parallel_branches: on
+  model_routing: on
+  reasoning_routing: on
+  dependency_graph: on
+  subagent_delegation: shadow
+  semantic_cache: off               # repository state changes under the cache
+  speculative_execution: off

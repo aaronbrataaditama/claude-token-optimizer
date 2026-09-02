@@ -1,0 +1,82 @@
+# Profile: database analytics agent
+#
+# Large result sets, joins, aggregation. Payload volume dominates everything.
+# The code-execution bypass is the single highest-value mechanism here and is
+# the reason this profile exists.
+#
+# Layered over config/optimizer.defaults.yaml. Only differences appear here.
+
+meta:
+  profile: database-analytics
+
+# Turns are expensive, so optimizing almost always pays. The fast path should
+# fire rarely — and when it does, it is genuinely a trivial follow-up question.
+fast_path:
+  max_utilization: 0.25
+  max_tools: 2
+  min_turn_cost_usd: 0.005
+  max_consecutive: 10
+
+overhead:
+  max_fraction: 0.12                # an expensive turn can afford real analysis
+  max_model_advisor_calls: 1
+
+budgets:
+  tool_results_fraction: 0.34       # this is where the tokens go
+  memory_fraction: 0.08
+  per_tool:
+    database_query: 6000
+    search: 2000
+    code_execution: 2000
+  max_tokens_by_operation_class:
+    code_generation: 6000
+
+# Payloads arrive in large steps, so react earlier and leave more headroom.
+thresholds:
+  bands:
+    - { band: NORMAL,     enter: 0.00, exit: 0.00 }
+    - { band: PRUNE,      enter: 0.42, exit: 0.34 }
+    - { band: COMPACT,    enter: 0.62, exit: 0.52 }
+    - { band: AGGRESSIVE, enter: 0.74, exit: 0.66 }
+    - { band: EMERGENCY,  enter: 0.86, exit: 0.78 }
+
+# Result sets are large and mostly read once. Externalize eagerly.
+context:
+  expected_remaining_turns_default: 4
+  disposition:
+    externalize_when_tokens_above: 800
+
+compression:
+  aggressiveness: balanced
+
+tools:
+  bypass:
+    enabled: true
+    min_payload_tokens: 2500        # trigger earlier than the default
+    min_homogeneous_calls: 2
+    sandbox:
+      cpu_ms: 30000
+      wall_ms: 60000
+      memory_mb: 1024
+      egress_bytes_max: 32768       # tighter: the answer is an aggregate, not a table
+  router:
+    k_candidates: 4
+
+parallelism:
+  enabled: true
+  max_branches: 6                   # independent queries fan out well
+
+delegation:
+  enabled: true
+  max_subagents_per_turn: 3
+  min_expected_saving_usd: 0.02
+
+flags:
+  code_execution_bypass: on         # the mechanism this profile is built around
+  parallel_branches: on
+  dependency_graph: on
+  progressive_tool_disclosure: on   # few, large schemas; disclosure pays here
+  model_routing: on
+  reasoning_routing: on
+  subagent_delegation: shadow
+  semantic_cache: off               # analytics answers are tenant- and time-scoped

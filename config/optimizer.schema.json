@@ -1,0 +1,865 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/token-optimizer/optimizer.schema.json",
+  "title": "Token Optimizer Configuration",
+  "description": "Structural validation for the merged configuration. Types, enums, ranges and required keys are enforced here. Cross-field semantic invariants (V1-V16) cannot be expressed in JSON Schema and are enforced by the validator described in docs/configuration.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["meta", "fast_path", "overhead", "budgets", "thresholds", "context", "compression", "middleware", "estimation", "context_manager", "cache", "tools", "models", "delegation", "parallelism", "retry", "guards", "memory", "security", "telemetry", "skill", "gates", "flags", "providers"],
+
+  "$defs": {
+    "fraction": { "type": "number", "minimum": 0, "maximum": 1 },
+    "positiveInt": { "type": "integer", "minimum": 1 },
+    "nonNegInt": { "type": "integer", "minimum": 0 },
+    "usd": { "type": "number", "minimum": 0 },
+    "flagState": { "enum": ["on", "off", "shadow"] },
+    "riskLevel": { "enum": ["LOW", "MEDIUM", "HIGH"] },
+    "trustLevel": { "enum": ["EXTERNAL", "TOOL", "USER", "SYSTEM"] },
+    "reasoningTier": { "enum": ["NONE", "LOW", "MEDIUM", "HIGH"] },
+    "aggressiveness": { "enum": ["conservative", "balanced", "aggressive"] },
+    "bandName": { "enum": ["NORMAL", "PRUNE", "COMPACT", "AGGRESSIVE", "EMERGENCY"] },
+    "tokenBudget": { "type": "integer", "minimum": 1, "maximum": 2000000 },
+    "band": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["band", "enter", "exit"],
+      "properties": {
+        "band": { "$ref": "#/$defs/bandName" },
+        "enter": { "$ref": "#/$defs/fraction" },
+        "exit": { "$ref": "#/$defs/fraction" }
+      }
+    }
+  },
+
+  "properties": {
+    "meta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["config_version", "memory_schema_version", "profile"],
+      "properties": {
+        "config_version": { "$ref": "#/$defs/positiveInt" },
+        "memory_schema_version": { "$ref": "#/$defs/positiveInt" },
+        "profile": { "type": "string", "minLength": 1 }
+      }
+    },
+
+    "fast_path": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "max_utilization", "max_tools", "min_turn_cost_usd", "max_consecutive", "always_on"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "max_utilization": { "$ref": "#/$defs/fraction" },
+        "max_prompt_tokens": { "$ref": "#/$defs/tokenBudget",
+          "description": "V26: an absolute gate is required alongside the fraction. On a large window a fraction alone never trips until a turn is already expensive." },
+        "max_tools": { "$ref": "#/$defs/nonNegInt" },
+        "min_turn_cost_usd": { "$ref": "#/$defs/usd" },
+        "require_warm_prefix": { "type": "boolean" },
+        "allow_media": { "type": "boolean" },
+        "max_risk": { "$ref": "#/$defs/riskLevel" },
+        "max_consecutive": { "$ref": "#/$defs/positiveInt" },
+        "blocking_flags": { "type": "array", "items": { "type": "string" } },
+        "always_on": {
+          "type": "array",
+          "minItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "max_tokens_by_operation_class", "stop_sequences",
+              "structured_output_when_schema_present", "stable_prefix_ordering",
+              "append_only_history", "per_tool_result_budgets", "drop_manifest",
+              "trust_labelling"
+            ]
+          },
+          "description": "V12: all eight zero-cost controls must remain listed. Removing one makes the fast path strictly worse for no saving."
+        }
+      }
+    },
+
+    "overhead": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["floor_usd", "max_fraction", "max_model_advisor_calls"],
+      "properties": {
+        "floor_usd": { "$ref": "#/$defs/usd" },
+        "max_fraction": { "type": "number", "minimum": 0, "maximum": 0.5 },
+        "max_model_advisor_calls": { "type": "integer", "minimum": 0, "maximum": 3 },
+        "advisor_deadline_ms": { "$ref": "#/$defs/positiveInt" },
+        "scheduler": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ranking": { "enum": ["savings_lo_over_cost_hi", "savings_mid_over_cost_mid"] },
+            "min_ratio": { "type": "number", "minimum": 1.0 },
+            "prior_source": { "enum": ["ledger_ewma", "static"] },
+            "prior_halflife_turns": { "$ref": "#/$defs/positiveInt" },
+            "cold_advisor_policy": { "enum": ["shadow_first", "optimistic"] }
+          }
+        }
+      }
+    },
+
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reserved_output_fraction", "reserved_system_skill_fraction", "safety_margin_fraction", "working_fraction", "tool_results_fraction", "memory_fraction", "per_tool", "max_tokens_by_operation_class"],
+      "properties": {
+        "reserved_output_fraction": { "$ref": "#/$defs/fraction" },
+        "reserved_system_skill_fraction": { "$ref": "#/$defs/fraction" },
+        "safety_margin_fraction": { "$ref": "#/$defs/fraction" },
+        "working_fraction": { "$ref": "#/$defs/fraction" },
+        "tool_results_fraction": { "$ref": "#/$defs/fraction" },
+        "memory_fraction": { "$ref": "#/$defs/fraction" },
+        "output_headroom": { "type": "number", "minimum": 1.0, "maximum": 4.0 },
+        "min_reserved_output": { "$ref": "#/$defs/tokenBudget" },
+        "per_tool": {
+          "type": "object",
+          "required": ["default"],
+          "additionalProperties": { "$ref": "#/$defs/tokenBudget" }
+        },
+        "per_modality": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "max_tokens": { "$ref": "#/$defs/tokenBudget" },
+              "max_edge_px": { "$ref": "#/$defs/positiveInt" },
+              "prefer_text_extraction": { "type": "boolean" },
+              "resend_unchanged": { "type": "boolean" },
+              "max_per_task": { "$ref": "#/$defs/positiveInt" },
+              "rasterize": { "type": "boolean" }
+            }
+          }
+        },
+        "max_tokens_by_operation_class": {
+          "type": "object",
+          "required": ["default"],
+          "additionalProperties": { "$ref": "#/$defs/tokenBudget" }
+        }
+      }
+    },
+
+    "thresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bands"],
+      "properties": {
+        "bands": {
+          "type": "array",
+          "minItems": 5,
+          "maxItems": 5,
+          "items": { "$ref": "#/$defs/band" }
+        },
+        "emergency_suspends_economics": { "type": "boolean" },
+        "absolute_enter_tokens": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["PRUNE", "COMPACT", "AGGRESSIVE", "EMERGENCY"],
+          "properties": {
+            "PRUNE": { "$ref": "#/$defs/tokenBudget" },
+            "COMPACT": { "$ref": "#/$defs/tokenBudget" },
+            "AGGRESSIVE": { "$ref": "#/$defs/tokenBudget" },
+            "EMERGENCY": { "$ref": "#/$defs/tokenBudget" }
+          },
+          "description": "V27: absolute band entry points, ascending. Bands trip on whichever of fraction or absolute count comes first." },
+        "emergency_rate_alarm_per_100_turns": { "type": "number", "minimum": 0 }
+      }
+    },
+
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "scoring_weights": {
+          "type": "object",
+          "additionalProperties": { "type": "number", "minimum": 0 }
+        },
+        "recency_halflife_turns": { "$ref": "#/$defs/positiveInt" },
+        "expected_remaining_turns_default": { "$ref": "#/$defs/positiveInt" },
+        "dependency_closure": { "type": "boolean" },
+        "dependency_graph_enabled": { "type": "boolean" },
+        "disposition": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "discard_requires_all": { "type": "array", "items": { "type": "string" }, "minItems": 2 },
+            "retrieve_later_when": { "type": "string" },
+            "externalize_when_tokens_above": { "$ref": "#/$defs/positiveInt" },
+            "never_compress": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 13,
+              "items": { "type": "string" },
+              "description": "V14: the shipped list is a floor. A profile may add entries; removing one is rejected."
+            }
+          }
+        }
+      }
+    },
+
+    "compression": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["aggressiveness"],
+      "properties": {
+        "aggressiveness": { "$ref": "#/$defs/aggressiveness" },
+        "levels": { "type": "object" },
+        "never_summarize_same_content_twice": { "const": true },
+        "canonical_reference_required_when_lossy": { "const": true },
+        "summary_confidence_min": { "$ref": "#/$defs/fraction" },
+        "compaction": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "tail_first": { "type": "boolean" },
+            "require_positive_benefit": { "const": true },
+            "batch_at_boundaries": {
+              "type": "array",
+              "items": { "enum": ["SESSION_START", "TASK_TRANSITION", "TTL_LAPSE", "EMERGENCY"] }
+            },
+            "max_pending_batched": { "$ref": "#/$defs/positiveInt" }
+          }
+        }
+      }
+    },
+
+    "middleware": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["archive_before_reduce", "ladder", "nulls", "relevance", "dedupe", "truncation", "representation"],
+      "properties": {
+        "archive_before_reduce": { "const": true },
+        "ladder": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["rungs", "lossy_rungs", "always_available"],
+          "properties": {
+            "rungs": {
+              "type": "array",
+              "minItems": 8,
+              "maxItems": 8,
+              "uniqueItems": true,
+              "items": {
+                "enum": ["remove_nulls", "remove_irrelevant_fields", "deduplicate", "rank_records",
+                         "truncate_fields", "summarize_repetitive", "project_and_paginate", "externalize"]
+              },
+              "description": "V18: rung order is fixed. Reordering changes which reductions run before the budget is met."
+            },
+            "lossy_rungs": { "type": "array", "items": { "type": "string" } },
+            "always_available": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "const": "externalize" },
+              "description": "V19: externalization is lossless and must remain reachable at any aggressiveness."
+            }
+          }
+        },
+        "nulls": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "drop_explicit_null": { "type": "boolean" },
+            "drop_empty_string": { "type": "boolean" },
+            "drop_empty_collection": { "type": "boolean" }
+          }
+        },
+        "relevance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["protected_field_patterns"],
+          "properties": {
+            "min_field_relevance": { "$ref": "#/$defs/fraction" },
+            "min_field_bytes": { "$ref": "#/$defs/positiveInt" },
+            "protected_field_patterns": {
+              "type": "array",
+              "minItems": 12,
+              "uniqueItems": true,
+              "items": { "type": "string" },
+              "description": "V20: append-only floor. Removing a pattern lets a scoring heuristic drop an authorization-bearing field."
+            }
+          }
+        },
+        "dedupe": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "identity": { "type": "array", "minItems": 1, "items": { "enum": ["declared_key", "content_hash"] } },
+            "record_multiplicity": { "const": true }
+          }
+        },
+        "truncation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "boundary": { "enum": ["semantic", "word", "codepoint"] },
+            "min_field_bytes": { "$ref": "#/$defs/positiveInt" },
+            "marker": { "type": "string", "minLength": 1 }
+          }
+        },
+        "rank": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "min_records": { "$ref": "#/$defs/positiveInt" },
+            "preserve_total_count": { "const": true,
+              "description": "V24: a ranked result must carry its total, or it is indistinguishable from a complete one." }
+          }
+        },
+        "pagination": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "min_page_size": { "$ref": "#/$defs/positiveInt" },
+            "cursor_based": { "const": true,
+              "description": "V25: offset pagination over a live result silently skips or repeats records." },
+            "require_sort_key": { "const": true }
+          }
+        },
+        "summarize": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "min_records": { "$ref": "#/$defs/positiveInt" } }
+        },
+        "representation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_candidates": { "type": "integer", "minimum": 1, "maximum": 6 },
+            "exact_measure_final": { "const": true },
+            "yaml_requires": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "min_key_repetition": { "$ref": "#/$defs/fraction" },
+                "max_mean_string_len": { "$ref": "#/$defs/positiveInt" },
+                "max_depth": { "$ref": "#/$defs/positiveInt" }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "estimation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exact_below_bytes", "approximate_safety_multiplier", "bytes_per_token_fallback"],
+      "properties": {
+        "exact_below_bytes": { "$ref": "#/$defs/positiveInt" },
+        "sample_windows": { "type": "integer", "minimum": 2, "maximum": 64 },
+        "sample_window_bytes": { "$ref": "#/$defs/positiveInt" },
+        "extrapolation_variance_alarm": { "$ref": "#/$defs/fraction" },
+        "approximate_safety_multiplier": { "type": "number", "minimum": 1.0, "maximum": 3.0 },
+        "bytes_per_token_fallback": { "type": "number", "minimum": 1.0, "maximum": 10.0 }
+      }
+    },
+
+    "context_manager": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scoring", "summary_validation", "checkpoint"],
+      "properties": {
+        "scoring": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "relevance_floor": { "$ref": "#/$defs/fraction" },
+            "future_value_prior": { "$ref": "#/$defs/fraction" },
+            "low_future_value": { "$ref": "#/$defs/fraction" },
+            "high_future_value": { "$ref": "#/$defs/fraction" },
+            "high_relevance": { "$ref": "#/$defs/fraction" },
+            "importance_by_kind": {
+              "type": "object",
+              "additionalProperties": { "$ref": "#/$defs/fraction" }
+            }
+          }
+        },
+        "summary_validation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "critical_classes": { "type": "array", "minItems": 4, "items": { "type": "string" } },
+            "numeric_match_required": { "const": true },
+            "identifier_match_required": { "const": true },
+            "max_new_entities": { "type": "integer", "minimum": 0, "maximum": 0 },
+            "contradiction_check": { "type": "boolean" }
+          }
+        },
+        "checkpoint": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "structural_sharing": { "const": true },
+            "max_per_turn": { "type": "integer", "minimum": 1, "maximum": 64 },
+            "collapse_when_exceeded": { "type": "boolean" }
+          }
+        }
+      }
+    },
+
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "prefix": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "stable_layer_order": {
+              "type": "array",
+              "minItems": 6,
+              "maxItems": 6,
+              "items": { "enum": ["system", "skill", "tool_schemas", "long_term_memory", "conversation_history", "current_turn"] },
+              "description": "V4: order is fixed most-static-first; the validator rejects any permutation."
+            },
+            "append_only_history": { "const": true },
+            "max_breakpoints": {},
+            "min_prefix_tokens": {},
+            "ttl_seconds": {}
+          }
+        },
+        "result": { "type": "object" },
+        "semantic": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "ttl_seconds": { "$ref": "#/$defs/nonNegInt" },
+            "require_validation_when": { "type": "array", "items": { "type": "string" } },
+            "forbid_when_scope_includes_user": { "type": "boolean" }
+          }
+        },
+        "schema": { "type": "object" },
+        "retrieval": { "type": "object" },
+        "invalidate_on": { "type": "array", "items": { "type": "string" }, "minItems": 3 }
+      }
+    },
+
+    "tools": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "registry": { "type": "object" },
+        "router": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "k_candidates": { "type": "integer", "minimum": 1, "maximum": 50 },
+            "max_active_tools": { "type": "integer", "minimum": 1, "maximum": 128 },
+            "default_disclosure_level": { "type": "integer", "minimum": 0, "maximum": 3 },
+            "escalate_to_full_schema_on": { "type": "string" },
+            "compact_signatures": { "type": "boolean" },
+            "signature_style": { "enum": ["typescript", "python", "terse"] },
+            "signature_max_depth": { "type": "integer", "minimum": 1, "maximum": 6 },
+            "prefer_stable_projection": { "type": "boolean" },
+            "churn_tolerance_usd": { "$ref": "#/$defs/usd" },
+            "churn_margin": { "type": "number", "minimum": 1.0 },
+            "stability_window_turns": { "$ref": "#/$defs/nonNegInt" },
+            "incumbency_bonus": { "type": "number", "minimum": 1.0, "maximum": 4.0 },
+            "rerank_margin": { "$ref": "#/$defs/fraction" },
+            "rerank_top_k": { "type": "integer", "minimum": 2, "maximum": 16 }
+          }
+        },
+        "necessity": { "type": "object" },
+        "bypass": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "min_payload_tokens": { "$ref": "#/$defs/positiveInt" },
+            "min_homogeneous_calls": { "$ref": "#/$defs/positiveInt" },
+            "triggers_on_data_heavy": { "type": "boolean" },
+            "forbid_on_mutations_without_idempotency": { "const": true },
+            "sandbox": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["cpu_ms", "memory_mb", "wall_ms", "network", "egress_bytes_max"],
+              "properties": {
+                "cpu_ms": { "$ref": "#/$defs/positiveInt" },
+                "memory_mb": { "$ref": "#/$defs/positiveInt" },
+                "wall_ms": { "$ref": "#/$defs/positiveInt" },
+                "network": { "enum": ["NONE", "ALLOWLIST"] },
+                "allowlist": { "type": "array", "items": { "type": "string" } },
+                "filesystem": { "enum": ["NONE", "SCRATCH"] },
+                "egress_bytes_max": { "$ref": "#/$defs/positiveInt" }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "models": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tiers": { "type": "object" },
+        "bindings": { "type": "object" },
+        "routing": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "default_tier": { "type": "integer", "minimum": 1, "maximum": 4 },
+            "prefer_deterministic": { "type": "boolean" },
+            "by_operation_class": {
+              "type": "object",
+              "additionalProperties": { "type": "integer", "minimum": 1, "maximum": 4 }
+            },
+            "escalate_on_low_confidence_below": { "$ref": "#/$defs/fraction" },
+            "router_must_pay_for_itself": { "const": true },
+            "quality_floor_by_risk": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["LOW", "MEDIUM", "HIGH"],
+              "properties": {
+                "LOW": { "$ref": "#/$defs/fraction" },
+                "MEDIUM": { "$ref": "#/$defs/fraction" },
+                "HIGH": { "$ref": "#/$defs/fraction" }
+              },
+              "description": "V21: floors must be non-decreasing with risk — a higher-risk task may never accept a lower quality bar."
+            },
+            "min_quality_samples": { "$ref": "#/$defs/positiveInt" },
+            "tier_quality_prior": { "type": "object", "additionalProperties": { "$ref": "#/$defs/fraction" } },
+            "unmeasured_quality_width": { "$ref": "#/$defs/fraction" },
+            "switching_cost_aware": { "const": true },
+            "switch_margin": { "type": "number", "minimum": 1.0, "maximum": 3.0 },
+            "max_escalation_steps": { "type": "integer", "minimum": 0, "maximum": 5 }
+          }
+        },
+        "reasoning": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "tiers": { "type": "array", "items": { "$ref": "#/$defs/reasoningTier" } },
+            "default": { "$ref": "#/$defs/reasoningTier" },
+            "thinking_tokens": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["NONE", "LOW", "MEDIUM", "HIGH"],
+              "properties": {
+                "NONE": { "const": 0 },
+                "LOW": { "$ref": "#/$defs/nonNegInt" },
+                "MEDIUM": { "$ref": "#/$defs/nonNegInt" },
+                "HIGH": { "$ref": "#/$defs/nonNegInt" }
+              }
+            },
+            "by_operation_class": {
+              "type": "object",
+              "additionalProperties": { "$ref": "#/$defs/reasoningTier" }
+            },
+            "forbid_for_subagents": { "type": "boolean" },
+            "escalate_before_model_tier": { "type": "boolean" }
+          }
+        },
+        "handoff": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "recompute_budgets_on_tokenizer_change": { "const": true },
+            "verify_against_byte_bound": { "const": true }
+          }
+        }
+      }
+    },
+
+    "delegation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "max_depth": { "type": "integer", "minimum": 0, "maximum": 6 },
+        "sane_depth_limit": { "type": "integer", "minimum": 1, "maximum": 4 },
+        "explicit_deep_delegation": { "type": "boolean" },
+        "max_subagents_per_turn": { "$ref": "#/$defs/nonNegInt" },
+        "max_subagents_per_session": { "$ref": "#/$defs/nonNegInt" },
+        "require_structured_output": { "const": true },
+        "require_explicit_input_allowlist": { "const": true },
+        "forbid_skill_injection": { "const": true },
+        "trust_ceiling": { "const": "min_of_inputs" },
+        "include_cache_state_in_economics": { "type": "boolean" },
+        "min_expected_saving_usd": { "$ref": "#/$defs/usd" },
+        "spawn_budget_usd_per_turn": { "$ref": "#/$defs/usd" },
+        "spawn_budget_usd_per_session": { "$ref": "#/$defs/usd" },
+        "depth_attenuation": { "type": "number", "exclusiveMinimum": 0, "maximum": 1.0,
+          "description": "V22: must be at most 1.0, or a delegation tree's cost diverges with depth." },
+        "max_tool_calls_per_subagent": { "$ref": "#/$defs/positiveInt" },
+        "max_context_transfer_tokens": { "$ref": "#/$defs/tokenBudget" },
+        "inline_threshold_tokens": { "$ref": "#/$defs/tokenBudget" },
+        "strict_inputs": { "type": "boolean" },
+        "result_max_tokens": { "$ref": "#/$defs/tokenBudget" },
+        "result_schema_retries": { "type": "integer", "minimum": 0, "maximum": 2 }
+      }
+    },
+
+    "parallelism": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "max_branches": { "type": "integer", "minimum": 1, "maximum": 16 },
+        "reducer": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "order": { "const": "DEPENDENCY_THEN_DISPATCH" },
+            "atomic_commit": { "const": true },
+            "conflict_policy": { "type": "string" },
+            "conflict_precedence": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "enum": ["higher_trust", "more_recent_valid_from", "lower_dispatch_index"] },
+              "description": "V23: higher_trust must come first where present — a more recent untrusted claim may never displace a trusted one."
+            },
+            "corroboration": { "type": "boolean" },
+            "unresolved_conflicts": { "const": "surface_as_disputed" }
+          }
+        },
+        "uncertain_dependency": { "const": "sequential" },
+        "speculation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "max_branches": { "type": "integer", "minimum": 1, "maximum": 4 },
+            "min_probability": { "$ref": "#/$defs/fraction" },
+            "forbid_side_effects": { "const": true },
+            "charge_discarded_branches": { "const": true }
+          }
+        }
+      }
+    },
+
+    "retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_retries_per_step": { "type": "integer", "minimum": 0, "maximum": 5 },
+        "max_retries_per_turn": { "type": "integer", "minimum": 0, "maximum": 20 },
+        "backoff": { "type": "object" },
+        "forbid_identical_retry": { "const": true },
+        "ladder": {
+          "type": "array",
+          "minItems": 6,
+          "items": {
+            "enum": ["deterministic_fix", "retry_with_changed_input", "raise_reasoning_effort",
+                     "escalate_model_tier", "fallback_tool", "abort_normalized"]
+          }
+        }
+      }
+    },
+
+    "guards": { "type": "object" },
+    "circuit_breaker": { "type": "object" },
+    "failure_reporting": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "context_error_lines": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "raw_details_to_archive": { "const": true },
+        "rollback_failed_branches": { "const": true }
+      }
+    },
+
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "extraction": { "type": "object" },
+        "retention": { "type": "object" },
+        "temporal_validity": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "require_as_of_on_query": { "const": true },
+            "exclude_superseded": { "const": true },
+            "contradiction_policy": { "type": "string" },
+            "unresolved": { "const": "surface_as_disputed" }
+          }
+        },
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "required_fields": { "type": "array", "minItems": 12, "items": { "type": "string" } },
+            "append_with_supersede": { "const": true }
+          }
+        },
+        "resumption": { "type": "object" },
+        "migration": {
+          "type": "object",
+          "properties": {
+            "on_version_mismatch": { "const": "migrate_or_refuse_start" }
+          }
+        }
+      }
+    },
+
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "trust": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "levels": { "type": "array", "items": { "$ref": "#/$defs/trustLevel" } },
+            "derived_level": { "const": "min_of_inputs" },
+            "propagate_through": { "type": "array", "minItems": 5, "items": { "type": "string" } },
+            "render_untrusted_as": { "const": "delimited_data_with_label" },
+            "flag_instruction_like": { "const": true },
+            "obey_instruction_like": { "const": false }
+          }
+        },
+        "sanitization": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "before_external_write": { "const": true },
+            "detect": { "type": "array", "minItems": 2, "items": { "type": "string" } },
+            "action": { "enum": ["redact_and_record", "tokenize_and_record"] }
+          }
+        },
+        "isolation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cache_key_includes_scope": { "const": true },
+            "cross_tenant_reuse": { "const": "forbidden" },
+            "cross_user_semantic_cache": { "const": "forbidden" },
+            "sandbox_inherits_auth": { "const": true }
+          }
+        },
+        "retention": { "type": "object" },
+        "erasure": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "propagate_to": {
+              "type": "array",
+              "minItems": 5,
+              "items": { "enum": ["archive", "memory", "caches", "derived_summaries", "embeddings"] }
+            },
+            "max_completion_hours": { "$ref": "#/$defs/positiveInt" }
+          }
+        }
+      }
+    },
+
+    "telemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "const": true },
+        "sample_rate": { "$ref": "#/$defs/fraction" },
+        "baseline_method_default": { "enum": ["ESTIMATED", "MEASURED"] },
+        "record_categories": { "type": "array", "minItems": 20, "items": { "type": "string" } },
+        "decision_trace": { "type": "boolean" },
+        "record_fast_path_blockers": { "type": "boolean" },
+        "estimator_bias": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "const": true },
+            "alarm_abs_bias": { "$ref": "#/$defs/fraction" },
+            "window_turns": { "$ref": "#/$defs/positiveInt" },
+            "on_alarm": { "enum": ["reduce_confidence", "disable_advisor"] }
+          }
+        }
+      }
+    },
+
+    "skill": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "references_dir", "always_loaded", "max_tokens", "reference_max_tokens"],
+      "description": "V15: the always-loaded instruction set is measured at deploy time against max_tokens and the deployment fails above it.",
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "references_dir": { "type": "string", "minLength": 1 },
+        "always_loaded": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "target_tokens": { "type": "integer", "minimum": 1, "maximum": 2000 },
+        "max_tokens": { "type": "integer", "minimum": 1, "maximum": 800 },
+        "reference_max_tokens": { "type": "integer", "minimum": 1, "maximum": 4000 },
+        "measure_with": { "enum": ["target_model_tokenizer", "generic_estimator"] },
+        "cache_stable": { "const": true },
+        "measured_session_floor_tokens": { "$ref": "#/$defs/tokenBudget" }
+      }
+    },
+
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "acceptance": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cost_reduction_target": { "$ref": "#/$defs/fraction" },
+            "require_statistical_significance": { "const": true },
+            "confidence_level": { "type": "number", "minimum": 0.8, "maximum": 0.999 },
+            "max_success_drop_abs": { "type": "number", "minimum": 0, "maximum": 0.05 },
+            "max_p95_latency_increase": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        },
+        "per_optimization": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_success_drop_abs": { "type": "number", "minimum": 0, "maximum": 0.05 },
+            "max_p95_latency_increase": { "type": "number", "minimum": 0, "maximum": 1 },
+            "require_significant_token_reduction": { "const": true }
+          }
+        },
+        "workload_classes": { "type": "array", "minItems": 10, "items": { "type": "string" } },
+        "rollout": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "shadow_before_cutover": { "type": "boolean" },
+            "min_shadow_turns": { "$ref": "#/$defs/positiveInt" },
+            "ab_split": { "$ref": "#/$defs/fraction" },
+            "block_promotion_when_gates_unavailable": { "const": true }
+          }
+        },
+        "drift": { "type": "object" }
+      }
+    },
+
+    "flags": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/flagState" },
+      "required": ["fast_path", "drop_manifest", "stable_prefix_ordering", "output_controls"]
+    },
+
+    "providers": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "probe_at_startup": { "type": "boolean" },
+        "refuse_start_on_probe_mismatch": { "type": "boolean" },
+        "defaults": { "type": "object" },
+        "entries": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "prompt_cache_supported": { "type": "boolean" },
+              "cached_input_discount": { "$ref": "#/$defs/fraction" },
+              "max_breakpoints": { "$ref": "#/$defs/nonNegInt" },
+              "min_prefix_tokens": { "$ref": "#/$defs/nonNegInt" },
+              "cache_ttl_seconds": { "$ref": "#/$defs/nonNegInt" },
+              "structured_output": { "type": "boolean" },
+              "function_calling": { "type": "boolean" },
+              "batch": { "type": "boolean" },
+              "window": { "$ref": "#/$defs/positiveInt" },
+              "tokenizer": { "type": "string" },
+              "native": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        }
+      }
+    }
+  }
+}

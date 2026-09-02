@@ -1,0 +1,68 @@
+# Profile: conversational assistant
+#
+# Short turns, warm prefix, few tools, chat history dominates context.
+# Most turns should never reach the decision engine at all.
+#
+# Layered over config/optimizer.defaults.yaml. Only differences appear here.
+
+meta:
+  profile: conversational-assistant
+
+# The fast path is the main mechanism on this workload. Widen it, and let it
+# run longer between forced re-evaluations, because turns stay small.
+fast_path:
+  max_utilization: 0.45
+  max_tools: 5
+  min_turn_cost_usd: 0.02
+  max_consecutive: 40
+
+# Overhead must be tiny: the average turn costs cents, so a router that costs
+# a cent is a cost amplifier, not an optimizer.
+overhead:
+  max_fraction: 0.06
+  max_model_advisor_calls: 0        # deterministic advisors only
+
+budgets:
+  reserved_output_fraction: 0.18    # answers are the product here
+  tool_results_fraction: 0.12
+  memory_fraction: 0.18             # personalization carries the experience
+  max_tokens_by_operation_class:
+    final_answer: 1200
+
+# History is the bulk of context and it is cached. Leave it alone for longer.
+thresholds:
+  bands:
+    - { band: NORMAL,     enter: 0.00, exit: 0.00 }
+    - { band: PRUNE,      enter: 0.60, exit: 0.50 }
+    - { band: COMPACT,    enter: 0.78, exit: 0.68 }
+    - { band: AGGRESSIVE, enter: 0.86, exit: 0.78 }
+    - { band: EMERGENCY,  enter: 0.92, exit: 0.84 }
+
+compression:
+  aggressiveness: conservative      # losing a user preference is worse than paying for it
+
+context:
+  expected_remaining_turns_default: 15   # long sessions; retention usually beats retrieval
+
+memory:
+  extraction:
+    max_facts_per_session: 60
+  retention:
+    semantic_ttl_days: 1095
+
+# Tool schemas are few and stable. Churning them to save a few hundred tokens
+# would invalidate a prefix worth far more.
+tools:
+  router:
+    prefer_stable_projection: true
+    k_candidates: 8
+  bypass:
+    enabled: false                  # no data-heavy work on this workload
+
+flags:
+  progressive_tool_disclosure: off  # net-negative here: churn cost exceeds schema savings
+  code_execution_bypass: off
+  subagent_delegation: off
+  parallel_branches: off
+  dependency_graph: off
+  model_routing: shadow             # small models on classification only
